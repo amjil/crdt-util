@@ -1,18 +1,38 @@
 (ns my-app.main
   (:require ["package:flutter/material.dart" :as m]
+            ["package:mongol/mongol.dart" :as mongol] ;; third-party Mongol script layout library
             [cljd.flutter :as f]
-            [my-app.crdt-editor :as editor]))
+            [crdt.editor :as crdt-ui]))
 
 (defn main []
   (m.WidgetsFlutterBinding/ensureInitialized)
   (f/run
    (m/MaterialApp
-    .title "CRDT Editor"
     .theme (m/ThemeData
-            .useMaterial3 true
-            .colorScheme (m/ColorScheme.fromSeed .seedColor m.Colors/blue))
-    .home (m/Scaffold
-           .appBar (m/AppBar .title (m/Text "CRDT Editor"))
-           .body (m/Padding
-                  .padding (m.EdgeInsets/all 16.0)
-                  .child (editor/crdt-text-field "default-doc"))))))
+               .primarySwatch m.Colors/blue
+               .brightness m.Brightness/dark
+               .fontFamily "OyunQaganTig"
+               .visualDensity m.VisualDensity/adaptivePlatformDensity)
+    .home
+    (m/Scaffold
+     .appBar (m/AppBar .title (m/Text "Multilingual CRDT Collaboration Engine"))
+     .body
+     (m/Padding
+      .padding (m.EdgeInsets/all 16.0)
+      .child
+      (m/Column
+       .children
+       [(m/Text "Mongol vertical text input")
+        (m/Expanded
+         .child
+         (crdt-ui/crdt-editor-builder
+          {:url "ws://127.0.0.1:4000/socket/websocket"
+           :doc-id "doc-mongolian"
+           ;; Render MongolTextField via builder with the same underlying real-time sync.
+           :builder (fn [{:keys [controller on-changed]}]
+                      (mongol/MongolTextField
+                       .controller controller
+                       .onChanged on-changed
+                       .maxLines nil
+                       .style (m/TextStyle .fontSize 24.0 .fontFamily "MongolianBaiti")
+                       .decoration (m/InputDecoration .border (m/OutlineInputBorder))))}))]))))))

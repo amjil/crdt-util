@@ -1,0 +1,102 @@
+(ns crdt.client
+  "CRDT network sync engine (library core)"
+  (:require ["package:phoenix_socket/phoenix_socket.dart" :as phx]
+            ["dart:core" :as dc]
+            [crdt.pure :as crdt]))
+
+;; ==========================================
+;; Utils: deep sanitization of network data
+;; ==========================================
+(defn dart->clj [x]
+  (cond
+    (instance? dc/Map x)
+    (into {} (for [k (.-keys ^dc/Map x)] [k (dart->clj (get x k))]))
+    (instance? dc/Iterable x) 
+    (mapv dart->clj x)
+    :else x))
+
+;; ==========================================
+;; Lifecycle: start and destroy
+;; ==========================================
+(defn start-client! 
+  "Initialize a standalone CRDT client instance."
+  [{:keys [url topic site-id on-update]
+    :or {site-id (str "site-" (rand-int 1000000))}}]
+  
+  (let [state-atom (atom {:doc [] :pending-events [] :site site-id :seq 0})
+        socket  (phx/PhoenixSocket. url)
+        _       (.connect socket)
+        channel (.addChannel socket .topic topic)
+        _       (.join channel)
+        
+        msg-sub (-> channel
+                    .-messages
+                    (.listen (fn [msg]
+                               (let [event-name (-> msg .-event .-value)
+                                     payload    (dart->clj (.-payload msg))]
+                                 (case event-name
+                                   "init_sync"
+                                   (let [new-state (swap! state-atom #(crdt/apply-snapshot % (get payload "snapshot") (get payload "events")))]
+                                     (when on-update (on-update (crdt/render-text (:doc new-state)))))
+                                   
+                                   "new_event"
+                                   (let [new-state (swap! state-atom #(crdt/process-incoming-event % (get payload "event")))]
+                                     (when on-update (on-update (crdt/render-text (:doc new-state)))))
+                                   nil)))))]
+    
+    {:state-atom state-atom
+     :socket socket
+     :channel channel
+     :msg-sub msg-sub}))
+
+(defn stop-client! 
+  "Safely release all network resources and listeners."
+  [{:keys [^phx/PhoenixSocket socket ^phx/PhoenixChannel channel msg-sub]}]
+  (when msg-sub (.cancel msg-sub))
+  (when channel (.close channel))
+  ;; Fixed to use Dart-standard .dispose
+  (when socket (.dispose socket)))
+
+;; ==========================================
+;; Operations API: push local changes
+;; ==========================================
+(defn push-local-insert! 
+  "Push a character to the given client instance."
+  [{:keys [state-atom ^phx/PhoenixChannel channel]} char & [origin-id]]
+  (let [generated-id (atom nil)
+        new-state
+        (swap! state-atom
+               (fn [{:keys [doc site seq] :as state}]
+                 (let [new-seq   (inc seq)
+                       new-id    (crdt/make-id site new-seq)
+                       _         (reset! generated-id new-id)
+                       origin    (or origin-id
+                                     (get (last (remove #(get % "tombstone") doc)) "id"))
+                       new-node  (crdt/make-node new-id char origin)
+                       event     {"type" "insert" "node" new-node}]
+                   (-> state
+                       (assoc :seq new-seq)
+                       (assoc :last-emitted-event event)
+                       (update :doc crdt/insert-node new-node)))))
+        event (:last-emitted-event new-state)]
+
+    (.push channel "new_event" (doto (#/(dc/Map dc/String dynamic)) (.addAll {"event" event})))
+    
+    (when (zero? (mod (:seq new-state) 100))
+      (.push channel "save_snapshot"
+             (doto (#/(dc/Map dc/String dynamic))
+               (.addAll {"snapshot" (:doc new-state) "last_seq" (:seq new-state)}))))
+    @generated-id))
+
+(defn push-local-delete! 
+  "Push a delete operation to the given client instance."
+  [{:keys [state-atom ^phx/PhoenixChannel channel]} target-id]
+  (let [new-state
+        (swap! state-atom
+               (fn [state]
+                 (let [event {"type" "delete" "id" target-id}]
+                   (-> state
+                       (assoc :last-emitted-event event)
+                       (update :doc crdt/delete-node target-id)))))
+        event (:last-emitted-event new-state)]
+    (.push channel "new_event" (doto (#/(dc/Map dc/String dynamic)) (.addAll {"event" event})))))
