@@ -1,5 +1,5 @@
 name: crdt_editor_example
-description: "CRDT 协同编辑 Flutter 示例"
+description: "CRDT collaborative editing Flutter example"
 publish_to: 'none'
 version: 1.0.0+1
 

@@ -11,20 +11,20 @@
          :site (str "user-" (rand-int 1000000))
          :seq 0}))
 
-(defn connect-socket! [doc-id]
-  "Establish WebSocket connection and join the channel."
+(defn create-socket []
+  "Step 1: establish WebSocket connection only."
   (let [socket (phx/PhoenixSocket. "ws://127.0.0.1:4000/socket/websocket")]
-    
-    ;; Diagnostic logging
-    (-> socket .-openStream (.listen (fn [_] (dc/print "✅ WebSocket connected to Phoenix backend!"))))
+    (-> socket .-openStream (.listen (fn [_] (dc/print "✅ WebSocket connected!"))))
     (-> socket .-closeStream (.listen (fn [_] (dc/print "❌ WebSocket disconnected!"))))
     (-> socket .-errorStream (.listen (fn [err] (dc/print (str "⚠️ WebSocket error: " err)))))
-
     (.connect socket)
-    
-    (let [^phx/PhoenixChannel channel (.addChannel socket .topic (str "doc:" doc-id))]
-      (.join channel)
-      channel)))
+    socket))
+
+(defn join-channel [^phx/PhoenixSocket socket doc-id]
+  "Step 2: join the collaborative doc channel on the existing socket."
+  (let [^phx/PhoenixChannel channel (.addChannel socket .topic (str "doc:" doc-id))]
+    (.join channel)
+    channel))
 
 (defn push-local-insert! [^phx/PhoenixChannel channel char & [origin-id]]
   "Handle local insert, push to server, and return the new node ID."
