@@ -1,0 +1,74 @@
+(ns crdt.sync-client
+  "Phoenix WebSocket connection and CRDT state sync."
+  (:require ["package:phoenix_socket/phoenix_socket.dart" :as phx]
+            ["dart:core" :as dc]
+            [crdt.pure :as crdt]))
+
+;; Global app state; rand-int avoids site-id collision across clients
+(def app-state
+  (atom {:doc []
+         :pending-events []
+         :site (str "user-" (rand-int 1000000))
+         :seq 0}))
+
+(defn connect-socket! [doc-id]
+  "Establish WebSocket connection and join the channel."
+  (let [socket (phx/PhoenixSocket. "ws://127.0.0.1:4000/socket/websocket")]
+    
+    ;; Diagnostic logging
+    (-> socket .-openStream (.listen (fn [_] (dc/print "✅ WebSocket connected to Phoenix backend!"))))
+    (-> socket .-closeStream (.listen (fn [_] (dc/print "❌ WebSocket disconnected!"))))
+    (-> socket .-errorStream (.listen (fn [err] (dc/print (str "⚠️ WebSocket error: " err)))))
+
+    (.connect socket)
+    
+    (let [^phx/PhoenixChannel channel (.addChannel socket .topic (str "doc:" doc-id))]
+      (.join channel)
+      channel)))
+
+(defn push-local-insert! [^phx/PhoenixChannel channel char & [origin-id]]
+  "Handle local insert, push to server, and return the new node ID."
+  (let [generated-id (atom nil)
+        new-state
+        (swap! app-state
+               (fn [{:keys [doc site seq] :as state}]
+                 (let [new-seq   (inc seq)
+                       new-id    (crdt/make-id site new-seq)
+                       _         (reset! generated-id new-id) ;; capture new ID
+                       origin    (or origin-id
+                                     (get (last (remove #(get % "tombstone") doc)) "id"))
+                       new-node  (crdt/make-node new-id char origin)
+                       event     {"type" "insert" "node" new-node}]
+                   (-> state
+                       (assoc :seq new-seq)
+                       (assoc :last-emitted-event event)
+                       (update :doc crdt/insert-node new-node)))))
+        event (:last-emitted-event new-state)]
+
+    (.push channel "new_event"
+           (doto (#/(dc/Map dc/String dynamic))
+             (.addAll {"event" event})))
+
+    (when (zero? (mod (:seq new-state) 100))
+      (.push channel "save_snapshot"
+             (doto (#/(dc/Map dc/String dynamic))
+               (.addAll {"snapshot" (:doc new-state)
+                         "last_seq" (:seq new-state)}))))
+    
+    ;; Return generated ID for paste loop
+    @generated-id))
+
+(defn push-local-delete! [^phx/PhoenixChannel channel target-id]
+  "Handle local delete and push to server."
+  (let [new-state
+        (swap! app-state
+               (fn [state]
+                 (let [event {"type" "delete" "id" target-id}]
+                   (-> state
+                       (assoc :last-emitted-event event)
+                       (update :doc crdt/delete-node target-id)))))
+        event (:last-emitted-event new-state)]
+    
+    (.push channel "new_event"
+           (doto (#/(dc/Map dc/String dynamic))
+             (.addAll {"event" event})))))

@@ -1,0 +1,121 @@
+(ns crdt.pure
+  "CRDT pure functions: node construction, insert/delete, out-of-order event handling, and snapshot application.")
+
+;; =========================================
+;; 1. Data constructors
+;; =========================================
+
+(defn make-id [site-id seq-num]
+  {"site" site-id "seq" seq-num})
+
+(defn make-node [id val origin]
+  {"id" id "val" val "origin" origin "tombstone" false})
+
+;; =========================================
+;; 2. Core CRDT sequence operations
+;; =========================================
+
+(defn- compare-ids [id1 id2]
+  "Compare two IDs for total order (concurrent insert ordering)"
+  (let [c (compare (get id1 "seq") (get id2 "seq"))]
+    (if (zero? c)
+      (compare (get id1 "site") (get id2 "site"))
+      c)))
+
+(defn- should-skip? [new-id origin existing-node]
+  "Whether to skip current node when same insert point (concurrency rule)"
+  (and (= (get existing-node "origin") origin)
+       (pos? (compare-ids (get existing-node "id") new-id))))
+
+(defn insert-node [doc new-node]
+  "Insert new node into immutable document list."
+  (let [id (get new-node "id")
+        origin (get new-node "origin")]
+    (if (some #(= id (get % "id")) doc)
+      doc
+      (let [base-idx (if (nil? origin)
+                      0
+                      (let [idx (keep-indexed #(when (= (get %2 "id") origin) %1) doc)]
+                        (if (empty? idx) 0 (inc (first idx)))))
+            [left right] (split-at base-idx doc)
+            [skip keep]  (split-with #(should-skip? id origin %) right)]
+        (vec (concat left skip [new-node] keep))))))
+
+(defn delete-node [doc id]
+  "Logical delete (mark tombstone)."
+  (mapv (fn [node]
+          (if (= (get node "id") id)
+            (assoc node "tombstone" true)
+            node))
+        doc))
+
+;; =========================================
+;; 3. Out-of-order event handling and dependency resolution
+;; =========================================
+
+(defn- dependency-met? [doc event]
+  "Check whether event's causal dependency is already in local doc."
+  (case (get event "type")
+    "insert"
+    (let [origin (get (get event "node") "origin")]
+      (or (nil? origin)
+          (some #(= origin (get % "id")) doc)))
+
+    "delete"
+    (some #(= (get event "id") (get % "id")) doc)
+
+    false))
+
+(defn process-incoming-event [state new-event]
+  "Process a single event from network; resolves causal out-of-order.
+   State shape: {:doc [...] :pending-events [...]}"
+  (let [all-pending (conj (:pending-events state) new-event)
+        {ready true, still-pending false} (group-by #(dependency-met? (:doc state) %) all-pending)]
+
+    (loop [current-doc (:doc state)
+           pending     (or still-pending [])
+           to-process  (or ready [])]
+
+      (if (empty? to-process)
+        (assoc state :doc current-doc :pending-events pending)
+
+        (let [evt       (first to-process)
+              next-doc  (case (get evt "type")
+                          "insert" (insert-node current-doc (get evt "node"))
+                          "delete" (delete-node current-doc (get evt "id"))
+                          current-doc)
+
+              {new-ready true, new-pending false} (group-by #(dependency-met? next-doc %) pending)]
+
+          (recur next-doc
+                 (or new-pending [])
+                 (concat (rest to-process) (or new-ready []))))))))
+
+;; =========================================
+;; 4. Snapshotting
+;; =========================================
+
+(defn apply-snapshot [state snapshot-doc pending-events]
+  "Apply server snapshot and process subsequent events."
+  (let [state-with-snapshot (assoc state :doc snapshot-doc)]
+    (reduce process-incoming-event
+            state-with-snapshot
+            pending-events)))
+
+;; =========================================
+;; 5. View projection
+;; =========================================
+
+(defn render-text [doc]
+  "Project underlying state to visible plain string."
+  (let [visible (remove #(get % "tombstone") doc)
+        chars   (map #(get % "val") visible)]
+    (if (empty? chars)
+      ""
+      (apply str chars))))
+
+(defn get-node-id-at [doc idx]
+  "Return node id at visible index idx, or nil if out of range."
+  (let [visible (vec (remove #(get % "tombstone") doc))]
+    (when (and (<= 0 idx) (< idx (count visible)))
+      (get (get visible idx) "id"))))
